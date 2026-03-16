@@ -1,0 +1,23 @@
+# Compiled binaries
+simulator_gpu
+simulator_cpu
+*.o
+*.out
+
+# Simulation output
+results.csv
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# ROCm / GPU build artifacts
+*.hip
+*.hsaco
