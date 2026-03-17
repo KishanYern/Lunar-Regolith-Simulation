@@ -18,7 +18,7 @@ N=${1:-5000}
 echo "Attempting to compile with ROCm clang++ for AMD GPU..."
 echo "Targeting architecture: $ARCH (runtime override will map this to your gfx1032)"
 
-$CLANGXX -O3 -std=c++17 lunar_sim.cpp -o simulator_gpu \
+$CLANGXX -O3 -std=c++17 src/lunar_sim.cpp -o simulator_gpu \
     -fopenmp \
     --offload-arch=$ARCH
 
@@ -37,7 +37,9 @@ if [ $? -eq 0 ]; then
         echo ""
         echo "========================================"
         echo "Simulation completed successfully!"
-        echo "Check results in results.csv"
+        echo "Moving outputs to data/ directory..."
+        mv results.csv trajectory.csv data/
+        echo "Check results in data/results.csv"
     else
         echo ""
         echo "========================================"
@@ -46,6 +48,6 @@ if [ $? -eq 0 ]; then
     fi
 else
     echo "Compilation failed!"
-    echo "CPU fallback: g++ -O3 -std=c++17 -fopenmp lunar_sim.cpp -o simulator_cpu"
+    echo "CPU fallback: g++ -O3 -std=c++17 -fopenmp src/lunar_sim.cpp -o simulator_cpu"
     exit 1
 fi
