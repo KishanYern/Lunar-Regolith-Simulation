@@ -338,6 +338,9 @@ After the simulation completes, a summary of escaped particles is printed with c
 
 ## 3D Trajectory Reconstruction
 
+### Animation Preview
+![3D Trajectory](figures/trajectory_3d.gif)
+
 The physics engine is 2D: each particle has a radial position `px` (horizontal distance from the nozzle axis) and a height `py` (vertical distance above the ground plane). Because the rocket exhaust plume is axially symmetric, the 2D cross-section can be revolved around the vertical axis to produce a physically meaningful 3D scene.
 
 ### Coordinate conversion
@@ -364,8 +367,8 @@ This produces a 3D cone/fan of debris that is uniformly distributed in azimuth, 
 
 ### Where the conversion is applied
 
-- **`trajectory.csv`** contains pre-computed 3D coordinates. The `x`, `y`, `z`, `vx`, `vy`, `vz` columns are already in 3D Cartesian space — no post-processing needed.
-- **`results.csv`** stores the raw 2D final state plus the `theta` column. To reconstruct 3D positions from the final state, apply the formulas above using `final_x` as `px`, `peak_height` or 0 as `py`, and the `theta` value from the same row.
+- **`data/trajectory.csv`** contains pre-computed 3D coordinates. The `x`, `y`, `z`, `vx`, `vy`, `vz` columns are already in 3D Cartesian space — no post-processing needed.
+- **`data/results.csv`** stores the raw 2D final state plus the `theta` column. To reconstruct 3D positions from the final state, apply the formulas above using `final_x` as `px`, `peak_height` or 0 as `py`, and the `theta` value from the same row.
 
 ### Visualisation tools
 
@@ -416,11 +419,11 @@ The continuous gas plume (V_GAS = 2000 m/s) exerts drag that keeps particles abo
 
 ### Can I run this without a GPU?
 
-Yes. Compile with `g++ -O3 -std=c++17 -fopenmp lunar_sim.cpp -o simulator_cpu`. OpenMP target regions fall back to host execution. Performance will be significantly lower (10-50x slower depending on CPU core count and N), but the physics are identical.
+Yes. Compile with `g++ -O3 -std=c++17 -fopenmp src/lunar_sim.cpp -o simulator_cpu`. OpenMP target regions fall back to host execution. Performance will be significantly lower (10-50x slower depending on CPU core count and N), but the physics are identical.
 
 ### How do I change the plume parameters?
 
-All physical constants are defined at the top of `lunar_sim.cpp`. Key tuning knobs:
+All physical constants are defined at the top of `src/lunar_sim.cpp`. Key tuning knobs:
 
 - `V_GAS`: Exhaust velocity. Lower values reduce particle travel distance.
 - `RHO_G0` / `R_REF`: Control how quickly plume density falls off with distance.
@@ -451,11 +454,18 @@ Within each 0.01 s global timestep, the integrator computes the acceleration mag
 
 ```
 Regolith_Simulation/
-  lunar_sim.cpp        # Complete simulation source (single file)
-  run_simulation.sh    # Build + run script (accepts N as argument)
-  results.csv          # Per-particle final state (generated at runtime)
-  trajectory.csv       # 3D trajectory snapshots for visualisation (generated at runtime)
-  README.md            # This file
-  Visualization.md     # Post-processing and figure generation guide
-  .gitignore           # Excludes binaries, output, editor files
+  src/
+    lunar_sim.cpp         # Complete simulation source (single file)
+  scripts/
+    generate_plots.py     # Reproduces analysis PNGs
+    animate_3d.py         # Reproduces animated 3D tracking GIF
+  data/
+    results.csv           # Final destination output file upon script run
+    trajectory.csv        # Snapshot file constructed via execution output
+  figures/
+    ...                   # Precompiled representations generated from python analysis
+  README.md               # This file
+  figures.md              # Gallery of analysis visualization outputs
+  Visualization.md        # Post-processing requirements
+  run_simulation.sh       # Build + run script (compile -> execution -> data move)
 ```
