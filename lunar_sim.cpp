@@ -5,12 +5,15 @@
 #include <iostream>
 #include <random>
 #include <algorithm>
+#include <vector>
 
 // =====================================================================
 // Physical constants — host & device visible
 // =====================================================================
-const double RHO_PARTICLE    = 2700.0;
-const double EJECTION_RADIUS = 6.0;
+const double RHO_PARTICLE      = 2700.0;
+const double EJECTION_RADIUS   = 6.0;
+const double SNAPSHOT_INTERVAL = 0.1;   // seconds between trajectory snapshots
+const int    MAX_TRACERS       = 10000; // max particles tracked in trajectory output
 
 #pragma omp declare target
 
@@ -24,6 +27,7 @@ const double COR      = 0.4;
 const double FRICTION = 0.8;
 const double V_STOP   = 0.05;
 const double MU_GAS   = 1.5e-5;
+const double V_ESCAPE = 2376.0;  // lunar escape velocity (m/s)
 
 // Grid constants — must be device-visible for kernel use
 const double COLLISION_DOMAIN = 20.0;   // half-width of domain (m)
@@ -169,8 +173,16 @@ int main(int argc, char *argv[])
     double *pmass    = new double[N];
     double *pt_start = new double[N];
     double *ppeak    = new double[N];
-    int    *pactive  = new int   [N];
-    int    *pimp     = new int   [N];
+    int    *pactive       = new int   [N];
+    int    *pimp          = new int   [N];
+    int    *pescaped      = new int   [N];
+    double *pescape_speed = new double[N];
+    double *pescape_time  = new double[N];
+    double *ptheta        = new double[N]; // azimuthal angle for 3D reconstruction (host-only)
+
+    // --- Tracer particles for trajectory output ---
+    int n_tracers = std::min(N, MAX_TRACERS);
+    int *tracer_ids = new int[n_tracers];
 
     // --- Grid arrays (counting-sort / prefix-sum) ---
     int *grid_count  = new int[NUM_CELLS];
@@ -197,6 +209,7 @@ int main(int argc, char *argv[])
     std::uniform_real_distribution<double> t_dist(0.0, 5.0);
     std::uniform_real_distribution<double> angle_dist(-PI * 0.45, PI * 0.45);
     std::uniform_real_distribution<double> jitter(-0.05, 0.05);
+    std::uniform_real_distribution<double> theta_dist(0.0, 2.0 * PI);
 
     for (int i = 0; i < N; ++i) {
         double d = size_dist(gen);
@@ -216,24 +229,53 @@ int main(int argc, char *argv[])
         pvy[i]      = 0.0;
         pt_start[i] = t_dist(gen);
         ppeak[i]    = 0.0;
-        pactive[i]  = 0;
-        pimp[i]     = 0;
+        pactive[i]       = 0;
+        pimp[i]          = 0;
+        pescaped[i]      = 0;
+        pescape_speed[i] = 0.0;
+        pescape_time[i]  = 0.0;
+        ptheta[i]        = theta_dist(gen);
     }
 
-    std::cout << "Starting GPU-Accelerated Regolith Simulation (N=" << N << ")\n";
+    // --- Select tracer particles (Fisher-Yates partial shuffle) ---
+    {
+        std::vector<int> all_ids(N);
+        for (int i = 0; i < N; ++i) all_ids[i] = i;
+        for (int i = 0; i < n_tracers; ++i) {
+            std::uniform_int_distribution<int> pick(i, N - 1);
+            std::swap(all_ids[i], all_ids[pick(gen)]);
+        }
+        std::copy(all_ids.begin(), all_ids.begin() + n_tracers, tracer_ids);
+        std::sort(tracer_ids, tracer_ids + n_tracers);
+    }
 
-    double       current_time    = 0.0;
-    const double max_time        = 30.0;
-    int          global_stopped  = 0;
-    double       last_print_time = -1.0;
+    std::cout << "Starting GPU-Accelerated Regolith Simulation (N=" << N
+              << ", tracers=" << n_tracers << ")\n";
+
+    double       current_time      = 0.0;
+    const double max_time          = 30.0;
+    int          global_stopped    = 0;
+    double       last_print_time   = -1.0;
+    double       last_snapshot_time = -SNAPSHOT_INTERVAL; // triggers frame 0 immediately
+    int          snapshot_count    = 0;
+
+    // --- Open trajectory file for 3D visualisation ---
+    std::FILE *trajf = std::fopen("trajectory.csv", "w");
+    if (trajf) {
+        std::setvbuf(trajf, nullptr, _IOFBF, 1 << 16);
+        std::fprintf(trajf, "frame,time,id,x,y,z,vx,vy,vz,diameter,active\n");
+    } else {
+        std::cerr << "Warning: cannot open trajectory.csv for writing.\n";
+    }
 
     // Map everything to the device once for the entire simulation.
     // Arrays modified on device are tofrom; read-only ones are to; purely
     // intermediate GPU buffers are alloc (no host transfer cost).
     #pragma omp target data \
         map(tofrom: px[0:N], py[0:N], pvx[0:N], pvy[0:N])    \
-        map(tofrom: pactive[0:N], pimp[0:N], ppeak[0:N])       \
-        map(to:     pdiam[0:N], pmass[0:N], pt_start[0:N])     \
+        map(tofrom: pactive[0:N], pimp[0:N], ppeak[0:N])                    \
+        map(tofrom: pescaped[0:N], pescape_speed[0:N], pescape_time[0:N]) \
+        map(to:     pdiam[0:N], pmass[0:N], pt_start[0:N])                \
         map(alloc:  grid_count[0:NUM_CELLS],                    \
                     grid_offset[0:NUM_CELLS+1],                 \
                     grid_flat[0:N])                             \
@@ -246,6 +288,8 @@ int main(int argc, char *argv[])
         #pragma omp target
         col_count[0] = 0;
 
+        int global_escaped = 0;
+
         while (current_time < max_time && global_stopped < N) {
 
             // =============================================================
@@ -253,23 +297,39 @@ int main(int argc, char *argv[])
             // =============================================================
             int currently_active = 0;
             int loop_stopped     = 0;
+            int loop_escaped     = 0;
 
             #pragma omp target teams distribute parallel for \
-                reduction(+: currently_active, loop_stopped)
+                reduction(+: currently_active, loop_stopped, loop_escaped)
             for (int i = 0; i < N; ++i) {
-                if (!pactive[i] && !pimp[i] && current_time >= pt_start[i])
+                if (!pactive[i] && !pimp[i] && !pescaped[i] && current_time >= pt_start[i])
                     pactive[i] = 1;
 
                 if (pactive[i]) {
                     update_state(i, px, py, pvx, pvy,
                                  pmass, pdiam, pactive, pimp, ppeak);
+
+                    if (pactive[i]) {
+                        double spd_sq = pvx[i]*pvx[i] + pvy[i]*pvy[i];
+                        if (spd_sq >= V_ESCAPE * V_ESCAPE) {
+                            pescaped[i]      = 1;
+                            pescape_speed[i] = sqrt(spd_sq);
+                            pescape_time[i]  = current_time;
+                            pactive[i]       = 0;
+                        }
+                    }
+
                     currently_active++;
-                    if (!pactive[i]) loop_stopped++;
+                    if (!pactive[i] && !pescaped[i]) loop_stopped++;
+                    if (pescaped[i]) loop_escaped++;
+                } else if (pescaped[i]) {
+                    loop_escaped++;
                 } else if (pimp[i]) {
                     loop_stopped++;
                 }
             }
             global_stopped = loop_stopped;
+            global_escaped = loop_escaped;
 
             // =============================================================
             // Step 2 — Build grid via counting sort + exclusive prefix sum
@@ -453,6 +513,27 @@ int main(int argc, char *argv[])
 
             current_time += DT;
 
+            // =============================================================
+            // Trajectory snapshot — pull tracer positions to host at interval
+            // =============================================================
+            if (trajf && current_time - last_snapshot_time >= SNAPSHOT_INTERVAL) {
+                #pragma omp target update from(px[0:N], py[0:N], pvx[0:N], pvy[0:N], pactive[0:N])
+
+                int frame = snapshot_count++;
+                for (int t = 0; t < n_tracers; ++t) {
+                    int i  = tracer_ids[t];
+                    double ct = std::cos(ptheta[i]);
+                    double st = std::sin(ptheta[i]);
+                    std::fprintf(trajf,
+                        "%d,%.4f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%d\n",
+                        frame, current_time, pid[i],
+                        px[i] * ct, py[i], px[i] * st,
+                        pvx[i] * ct, pvy[i], pvx[i] * st,
+                        pdiam[i], pactive[i]);
+                }
+                last_snapshot_time = current_time;
+            }
+
             if (currently_active == 0 && current_time > 6.0) break;
 
             if (current_time - last_print_time >= 1.0) {
@@ -461,11 +542,18 @@ int main(int argc, char *argv[])
                 std::cout << "t=" << current_time
                           << "s  active=" << currently_active
                           << "  stopped=" << global_stopped
+                          << "  escaped=" << global_escaped
                           << "  collisions=" << n_col
                           << "  (" << pct << "%)" << std::endl;
             }
         }
     } // end target data — tofrom arrays are copied back to host here
+
+    if (trajf) {
+        std::fclose(trajf);
+        std::cout << "Trajectory written to trajectory.csv ("
+                  << snapshot_count << " frames, " << n_tracers << " tracers)\n";
+    }
 
     // =====================================================================
     // Buffered CSV output — avoids per-line syscall overhead at 1M particles
@@ -475,16 +563,60 @@ int main(int argc, char *argv[])
         std::cerr << "Error: cannot open results.csv for writing.\n";
     } else {
         std::setvbuf(outf, nullptr, _IOFBF, 1 << 16); // 64 KB I/O buffer
-        std::fprintf(outf, "id,diameter,mass,final_x,peak_height,t_start\n");
+        std::fprintf(outf, "id,diameter,mass,final_x,peak_height,t_start,escaped,escape_speed,escape_time,theta\n");
         for (int i = 0; i < N; ++i) {
-            std::fprintf(outf, "%d,%.6e,%.6e,%.6f,%.6f,%.4f\n",
+            std::fprintf(outf, "%d,%.6e,%.6e,%.6f,%.6f,%.4f,%d,%.6e,%.4f,%.6f\n",
                          pid[i], pdiam[i], pmass[i],
-                         px[i], ppeak[i], pt_start[i]);
+                         px[i], ppeak[i], pt_start[i],
+                         pescaped[i], pescape_speed[i], pescape_time[i],
+                         ptheta[i]);
         }
         std::fclose(outf);
     }
 
     std::cout << "Complete. Results written to results.csv (N=" << N << ")\n";
+
+    // =====================================================================
+    // Escaped-particle summary
+    // =====================================================================
+    {
+        int    n_esc      = 0;
+        double spd_sum    = 0.0, spd_min = 1e30, spd_max = 0.0;
+        double diam_sum   = 0.0, diam_min = 1e30, diam_max = 0.0;
+        double mass_sum   = 0.0, mass_min = 1e30, mass_max = 0.0;
+
+        for (int i = 0; i < N; ++i) {
+            if (!pescaped[i]) continue;
+            ++n_esc;
+            spd_sum  += pescape_speed[i];
+            spd_min   = std::min(spd_min,  pescape_speed[i]);
+            spd_max   = std::max(spd_max,  pescape_speed[i]);
+            diam_sum += pdiam[i];
+            diam_min  = std::min(diam_min, pdiam[i]);
+            diam_max  = std::max(diam_max, pdiam[i]);
+            mass_sum += pmass[i];
+            mass_min  = std::min(mass_min, pmass[i]);
+            mass_max  = std::max(mass_max, pmass[i]);
+        }
+
+        std::cout << "\n=== Escaped Particles Summary ===\n";
+        std::cout << "  Total escaped : " << n_esc << " / " << N << "\n";
+        if (n_esc > 0) {
+            std::cout << "  Escape speed (m/s) : "
+                      << "mean=" << spd_sum/n_esc
+                      << "  min=" << spd_min
+                      << "  max=" << spd_max << "\n";
+            std::cout << "  Diameter (m)       : "
+                      << "mean=" << diam_sum/n_esc
+                      << "  min=" << diam_min
+                      << "  max=" << diam_max << "\n";
+            std::cout << "  Mass (kg)          : "
+                      << "mean=" << mass_sum/n_esc
+                      << "  min=" << mass_min
+                      << "  max=" << mass_max << "\n";
+        }
+        std::cout << "=================================\n";
+    }
 
     // --- Cleanup ---
     delete[] pid;
@@ -493,6 +625,9 @@ int main(int argc, char *argv[])
     delete[] pdiam; delete[] pmass;
     delete[] pt_start; delete[] ppeak;
     delete[] pactive; delete[] pimp;
+    delete[] pescaped; delete[] pescape_speed; delete[] pescape_time;
+    delete[] ptheta;
+    delete[] tracer_ids;
 
     delete[] grid_count; delete[] grid_offset; delete[] grid_flat;
 

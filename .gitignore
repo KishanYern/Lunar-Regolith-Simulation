@@ -6,6 +6,7 @@ simulator_cpu
 
 # Simulation output
 results.csv
+trajectory.csv
 
 # Editor / IDE
 .vscode/
